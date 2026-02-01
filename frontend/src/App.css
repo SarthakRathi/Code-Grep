@@ -512,6 +512,20 @@ button:disabled::before {
   margin: 0 !important;
   border-radius: 0 !important;
   background: var(--code-bg) !important;
+  max-height: 300px; 
+  overflow-y: auto; 
+  font-size: 0.85rem;
+}
+
+.model-badge {
+  font-size: 0.7rem;
+  padding: 2px 8px;
+  border-radius: 12px;
+  background: #333;
+  color: #aaa;
+  border: 1px solid #555;
+  margin-left: 10px;
+  text-transform: uppercase;
 }
 
 .result-card code {

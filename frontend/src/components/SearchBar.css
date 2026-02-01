@@ -1,0 +1,43 @@
+/* Model Selector Buttons */
+.model-selector {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.model-chip {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-primary);
+  color: var(--text-secondary);
+  padding: 6px 16px;
+  font-size: 0.8rem;
+  border-radius: 20px; /* Pill shape */
+  cursor: pointer;
+  transition: all 0.2s ease;
+  box-shadow: none;
+}
+
+.model-chip:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  transform: translateY(-1px);
+}
+
+.model-chip.active {
+  background: rgba(88, 166, 255, 0.15); /* Light Blue Tint */
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+  font-weight: 600;
+  box-shadow: 0 0 8px rgba(88, 166, 255, 0.2);
+}
+
+/* Input Wrapper to align Button next to Input */
+.input-wrapper {
+  display: flex;
+  gap: 10px;
+}
+
+.search-btn {
+  padding: 0 24px;
+  white-space: nowrap;
+}

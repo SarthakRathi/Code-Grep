@@ -15,18 +15,14 @@ export const processRepository = async (repoUrl) => {
   }
 };
 
-export const searchCode = async (query) => {
-  // Same as before...
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      resolve([
-        {
-          id: 1,
-          filename: "packages/react-dom/client.js",
-          score: 0.89,
-          code: `export function createRoot(container, options) {\n  if (!isValidContainer(container)) {\n    throw new Error('createRoot(...): Target container is not a DOM element.');\n  }\n  // ...\n}`
-        }
-      ]);
-    }, 1000);
-  });
+export const searchCode = async (query, modelType) => {
+  try {
+    const response = await axios.get(`${API_BASE_URL}/search`, { 
+      params: { q: query, model: modelType } 
+    });
+    return response.data;
+  } catch (error) {
+    console.error("Search Error:", error);
+    return [];
+  }
 };

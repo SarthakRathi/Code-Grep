@@ -29,10 +29,15 @@ function App() {
     setResults([]);
   };
 
-  const handleSearch = async (query) => {
+  const handleSearch = async (query, model) => {
     setLoading(true);
-    const data = await searchCode(query);
-    setResults(data);
+    try {
+      console.log("App.jsx calling API with:", query, model);
+      const data = await searchCode(query, model);
+      setResults(data);
+    } catch (error) {
+      console.error("Search failed", error);
+    }
     setLoading(false);
   };
 
