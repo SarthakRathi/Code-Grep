@@ -1,36 +1,18 @@
 // src/services/api.js
 
+// src/services/api.js in Frontend
+import axios from 'axios';
+
+const API_BASE_URL = 'http://127.0.0.1:8000';
+
 export const processRepository = async (repoUrl) => {
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      resolve({
-        status: "indexed",
-        // Mock GitHub Metadata
-        details: {
-          owner: "facebook",
-          name: "react",
-          description: "A declarative, efficient, and flexible JavaScript library for building user interfaces.",
-          stars: 213000,
-          forks: 45000,
-          avatar: "https://avatars.githubusercontent.com/u/69631?v=4" // React logo
-        },
-        // Mock File Tree (Recursive structure)
-        fileTree: [
-          {
-            name: "packages",
-            type: "folder",
-            children: [
-              { name: "react", type: "folder", children: [{ name: "index.js", type: "file" }] },
-              { name: "react-dom", type: "folder", children: [{ name: "client.js", type: "file" }] }
-            ]
-          },
-          { name: "scripts", type: "folder", children: [{ name: "build.js", type: "file" }] },
-          { name: "README.md", type: "file" },
-          { name: "package.json", type: "file" }
-        ]
-      });
-    }, 1500);
-  });
+  try {
+    const response = await axios.post(`${API_BASE_URL}/process`, { repo_url: repoUrl });
+    return response.data;
+  } catch (error) {
+    console.error("API Error:", error);
+    throw error;
+  }
 };
 
 export const searchCode = async (query) => {
