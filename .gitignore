@@ -3,6 +3,7 @@
 venv/
 env/
 .env
+temp_repos
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
