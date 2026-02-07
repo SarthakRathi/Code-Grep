@@ -2,163 +2,176 @@
 import os
 import shutil
 import glob
-import stat
-import time
+import ast
+import re
 from git import Repo
 from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
 import faiss
 import numpy as np
 
-# --- 1. MODEL LOADER ---
 print("⏳ Loading AI Models...")
 model_minilm = SentenceTransformer('all-MiniLM-L6-v2')
-# We use a smaller CodeBERT to prevent memory crashes
-model_codebert = SentenceTransformer('krlvi/sentence-t5-base-nlpl-code_search_net') 
 print("✅ AI Models Loaded.")
 
 STORE = {
     "chunks": [],
     "bm25": None,
-    "faiss_minilm": None,
-    "faiss_codebert": None
+    "faiss_minilm": None
 }
 
-# --- WINDOWS PERMISSION FIX ---
-def on_rm_error(func, path, exc_info):
-    """
-    Error handler for shutil.rmtree.
-    If the file is read-only (Windows git issue), change it to writable and try again.
-    """
-    os.chmod(path, stat.S_IWRITE)
-    func(path)
+# --- 1. UTILS ---
+
+def anglicize_name(name):
+    # 'get_tasks' -> 'get tasks'
+    no_under = name.replace("_", " ")
+    split_camel = re.sub('([a-z])([A-Z])', r'\1 \2', no_under)
+    return split_camel.lower()
+
+def clean_docstring(docstring):
+    if not docstring: return ""
+    cleaned = re.sub(r'https?://\S+|www\.\S+', '', docstring)
+    return " ".join(cleaned.split())
+
+# --- 2. PARSER ---
+
+def extract_python_functions(code, filename):
+    results = []
+    try:
+        tree = ast.parse(code)
+        lines = code.splitlines()
+        
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                func_name = node.name
+                docstring = ast.get_docstring(node) or ""
+                
+                # Pre-process names
+                english_name = anglicize_name(func_name) # "get tasks"
+                clean_docs = clean_docstring(docstring)
+                
+                # MiniLM sees this (Broad Context)
+                ai_signature = f"function {english_name}. {clean_docs}"
+                
+                # BM25 sees ONLY this (Strict Name)
+                # We add the raw name too just in case user types "get_tasks" exactly
+                bm25_tokens = f"{english_name} {func_name}"
+                
+                start = node.lineno - 1
+                end = node.end_lineno if hasattr(node, 'end_lineno') else start + len(node.body)
+                body = "\n".join(lines[start:end])
+                
+                results.append({
+                    "name": func_name,
+                    "english_name": bm25_tokens, # <--- NEW FIELD FOR BM25
+                    "signature": ai_signature,   # Used for MiniLM
+                    "code": body,
+                    "filename": filename
+                })
+    except Exception as e:
+        pass
+    return results
+
+# --- 3. MAIN LOGIC ---
 
 def clone_and_process(repo_url):
     global STORE
-    
     repo_name = repo_url.split("/")[-1]
     repo_path = f"./temp_repos/{repo_name}"
-    
-    # 1. ROBUST CLEANUP (Fixes the "Access Denied" error)
+
     if os.path.exists(repo_path):
-        print(f"Cleaning up {repo_path}...")
-        try:
-            shutil.rmtree(repo_path, onerror=on_rm_error)
-        except Exception as e:
-            print(f"⚠️ Warning: Could not fully clean path: {e}")
-            # If we can't delete it, we assume it's already there and valid
-            pass 
+        shutil.rmtree(repo_path, ignore_errors=True)
     
-    # 2. CLONE (Only if not exists)
-    if not os.path.exists(repo_path):
-        print(f"Cloning {repo_url}...")
+    try:
         Repo.clone_from(repo_url, repo_path)
-    
-    # 3. READ FILES (Added .dart and .go)
-    # We also ignore common build/test folders to improve quality
-    extensions = [
-        "**/*.py", "**/*.js", "**/*.jsx", "**/*.ts", "**/*.tsx", 
-        "**/*.java", "**/*.cpp", "**/*.dart", "**/*.go", "**/*.rs"
-    ]
-    
-    code_files = []
-    for ext in extensions:
-        # Recursive glob search
-        found = glob.glob(f"{repo_path}/{ext}", recursive=True)
-        code_files.extend(found)
+    except: pass
         
-    documents = [] 
+    # We now have two separate lists for indexing
+    minilm_corpus = [] 
+    bm25_corpus = []
     metadata = []
     
-    print(f"Found {len(code_files)} code files. Processing...")
+    print("🚀 Scanning files...")
+    for root, dirs, files in os.walk(repo_path):
+        if ".git" in root or "node_modules" in root: continue
+        for file in files:
+            if file.endswith(".py"):
+                full_path = os.path.join(root, file)
+                try:
+                    with open(full_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    
+                    funcs = extract_python_functions(content, file)
+                    
+                    for f in funcs:
+                        # 1. Feed Signature to MiniLM
+                        minilm_corpus.append(f["signature"])
+                        
+                        # 2. Feed ONLY Name to BM25
+                        bm25_corpus.append(f["english_name"])
+                        
+                        metadata.append(f)
+                except: pass
 
-    for file_path in code_files:
-        # Skip "Generated" or "Build" files (improves accuracy)
-        if "build" in file_path or ".g.dart" in file_path or "node_modules" in file_path:
-            continue
+    if not minilm_corpus: return {"error": "No functions found."}
 
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            
-            # Chunking Logic
-            raw_chunks = content.split("\n\n")
-            for chunk in raw_chunks:
-                # Filter out tiny chunks (imports, braces)
-                if len(chunk) < 50: continue
-                
-                documents.append(chunk)
-                metadata.append({
-                    "id": len(metadata),
-                    "filename": os.path.relpath(file_path, repo_path),
-                    "code": chunk
-                })
-        except: continue # Skip binary/error files
-
-    if not documents: 
-        return {"error": "No valid code files found (checked py, js, java, dart, etc.)"}
+    print(f"Indexing {len(minilm_corpus)} functions...")
 
     # --- INDEXING ---
-    print(f"Indexing {len(documents)} chunks...")
 
-    # 1. BM25
-    tokenized_corpus = [doc.split(" ") for doc in documents]
-    STORE["bm25"] = BM25Okapi(tokenized_corpus)
+    # 1. BM25 (Strict Name Only)
+    # Tokenize the name string: "get tasks get_tasks" -> ['get', 'tasks', 'get_tasks']
+    tokenized_bm25 = [doc.split(" ") for doc in bm25_corpus]
+    STORE["bm25"] = BM25Okapi(tokenized_bm25)
 
-    # 2. MiniLM
-    embeddings_a = model_minilm.encode(documents)
-    index_a = faiss.IndexFlatL2(384)
-    index_a.add(np.array(embeddings_a))
-    STORE["faiss_minilm"] = index_a
-
-    # 3. CodeBERT
-    embeddings_b = model_codebert.encode(documents)
-    index_b = faiss.IndexFlatL2(768)
-    index_b.add(np.array(embeddings_b))
-    STORE["faiss_codebert"] = index_b
+    # 2. MiniLM (Full Context)
+    embeddings = model_minilm.encode(minilm_corpus)
+    index = faiss.IndexFlatL2(384)
+    index.add(np.array(embeddings))
+    STORE["faiss_minilm"] = index
     
     STORE["chunks"] = metadata
-    print("✅ Indexing Complete.")
     
-    return {"status": "success", "count": len(documents)}
+    return {"status": "success", "count": len(minilm_corpus)}
 
 def search_query(query, model_type="minilm", k=5):
     global STORE
     if not STORE["chunks"]: return []
     
     results = []
+    # Clean query for better matching
+    clean_q = query.lower().replace("code snippet", "").replace("how to", "").strip()
 
-    # STRATEGY 1: Keyword Search (BM25)
     if model_type == "bm25":
-        tokenized_query = query.split(" ")
+        # Tokenize query for BM25
+        tokenized_query = clean_q.split(" ")
         doc_scores = STORE["bm25"].get_scores(tokenized_query)
         top_n = np.argsort(doc_scores)[::-1][:k]
         
+        # Normalize Score (0-100 scale)
+        max_score = max([doc_scores[i] for i in top_n]) if len(top_n) > 0 else 1.0
+        if max_score == 0: max_score = 1.0
+
         for idx in top_n:
             if doc_scores[idx] > 0:
                 results.append({
-                    **STORE["chunks"][idx],
-                    "score": float(doc_scores[idx])
+                    **STORE["chunks"][idx], 
+                    "score": float(doc_scores[idx] / max_score), 
+                    "source_model": "BM25 (Strict Name)"
                 })
 
-    # STRATEGY 2 & 3: Vector Search
     else:
-        if model_type == "codebert":
-            model = model_codebert
-            index = STORE["faiss_codebert"]
-        else:
-            model = model_minilm
-            index = STORE["faiss_minilm"]
-
-        query_vector = model.encode([query])
-        distances, faiss_indices = index.search(np.array(query_vector), k)
+        # MiniLM Logic (unchanged)
+        query_vector = model_minilm.encode([clean_q])
+        distances, faiss_indices = STORE["faiss_minilm"].search(np.array(query_vector), k)
         
         for i, idx in enumerate(faiss_indices[0]):
             if idx < len(STORE["chunks"]) and idx != -1:
                 score = 1 / (1 + distances[0][i])
                 results.append({
                     **STORE["chunks"][idx],
-                    "score": float(score)
+                    "score": float(score),
+                    "source_model": "MiniLM"
                 })
                 
     return results
