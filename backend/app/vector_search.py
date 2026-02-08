@@ -11,44 +11,37 @@ import numpy as np
 
 # --- 1. MODEL LOADER ---
 print("⏳ Loading AI Models...")
-# MiniLM is used for semantic search (intent)
+
+# Model A: MiniLM (Good at English "Intent")
 model_minilm = SentenceTransformer('all-MiniLM-L6-v2')
+
+# Model B: CodeBERT (Good at "Code Structure" and "Language-to-Code")
+model_codebert = SentenceTransformer('flax-sentence-embeddings/st-codesearch-distilroberta-base')
+
 print("✅ AI Models Loaded.")
 
 STORE = {
     "chunks": [],
     "bm25": None,
-    "faiss_minilm": None
+    "faiss_minilm": None,
+    "faiss_codebert": None,
+    "current_repo": None
 }
 
-# --- 2. TEXT UTILS ---
+# --- 2. UTILS ---
 
 def anglicize_name(name):
-    """
-    Converts code names to English for better AI understanding.
-    'get_tasks' -> 'get tasks'
-    'calculateTax' -> 'calculate Tax'
-    """
-    # Replace underscores
+    """ 'get_tasks' -> 'get tasks' """
     no_under = name.replace("_", " ")
-    # Split camelCase
     split_camel = re.sub('([a-z])([A-Z])', r'\1 \2', no_under)
     return split_camel.lower()
 
 def clean_docstring(docstring):
-    """
-    Removes noise from docstrings.
-    """
     if not docstring: return ""
-    # Remove URLs
     cleaned = re.sub(r'https?://\S+|www\.\S+', '', docstring)
-    # Normalize whitespace
     return " ".join(cleaned.split())
 
 def simple_tokenize(text):
-    """
-    Splits text into tokens for BM25.
-    """
     return text.lower().split()
 
 # --- 3. PARSERS ---
@@ -64,45 +57,36 @@ def extract_python_functions(code, filename):
                 func_name = node.name
                 docstring = ast.get_docstring(node) or ""
                 
-                # --- PREPARE DATA ---
-                english_name = anglicize_name(func_name) # "get tasks"
+                # Data Prep
+                english_name = anglicize_name(func_name)
                 clean_docs = clean_docstring(docstring)
                 
-                # Extract the full function body
                 start = node.lineno - 1
                 end = node.end_lineno if hasattr(node, 'end_lineno') else start + len(node.body)
                 body = "\n".join(lines[start:end])
+                short_body = "\n".join(lines[start:start+5]) 
                 
-                # --- STRATEGY 1: MINI-LM (Semantic) ---
-                # We only show the AI the "Intent" (Name + Docstring).
-                # If we showed it the whole code, it might get confused by low-level logic.
+                # 3-View Indexing Strategy
                 ai_signature = f"function {english_name}. {clean_docs}"
-                
-                # --- STRATEGY 2: BM25 (Keyword / Grep) ---
-                # We show the Search Engine EVERYTHING (Name + Docstring + Body).
-                # WEIGHTING: We repeat the name 3 times so matches on the name bubble to the top.
                 bm25_text = f"{english_name} {english_name} {english_name} {clean_docs} {body}"
+                codebert_text = f"{short_body} ... {clean_docs}"
                 
                 results.append({
                     "name": func_name,
-                    "signature": ai_signature,   # For MiniLM
-                    "search_text": bm25_text,    # For BM25
-                    "code": body,                # For Display
+                    "signature": ai_signature,
+                    "codebert_text": codebert_text,
+                    "search_text": bm25_text,
+                    "code": body,
                     "filename": filename
                 })
-    except Exception as e:
-        # Skip files that fail parsing (syntax errors, etc.)
-        pass
+    except: pass
     return results
 
 def extract_c_style_functions(code, filename, lang="js"):
-    """
-    Simple fallback parser for JS/Java/Go/Dart using Regex + Brace Counting.
-    """
+    """ Regex-based parser for JS, Java, Go, Dart """
     results = []
     lines = code.splitlines()
     
-    # Regex to find function definitions
     patterns = {
         "js": r"function\s+([a-zA-Z0-9_]+)\s*\(|const\s+([a-zA-Z0-9_]+)\s*=\s*\(|class\s+([a-zA-Z0-9_]+)",
         "java": r"(?:public|private|protected|static|\s) +[\w\<\>\[\]]+\s+([a-zA-Z0-9_]+)\s*\(",
@@ -116,7 +100,7 @@ def extract_c_style_functions(code, filename, lang="js"):
         if match:
             func_name = next((m for m in match.groups() if m), "unknown")
             
-            # Simple brace counting to find end of function
+            # Simple brace counting
             if "{" in line:
                 open_braces = line.count("{")
                 close_braces = line.count("}")
@@ -132,13 +116,15 @@ def extract_c_style_functions(code, filename, lang="js"):
                 body = "\n".join(lines[i:end_index+1])
                 english_name = anglicize_name(func_name)
                 
-                # Same strategy as Python
                 ai_signature = f"function {english_name}."
                 bm25_text = f"{english_name} {english_name} {english_name} {body}"
-                
+                short_body = "\n".join(lines[i:i+5])
+                codebert_text = f"{short_body} ..."
+
                 results.append({
                     "name": func_name,
                     "signature": ai_signature,
+                    "codebert_text": codebert_text,
                     "search_text": bm25_text,
                     "code": body,
                     "filename": filename
@@ -149,24 +135,43 @@ def extract_c_style_functions(code, filename, lang="js"):
 
 def clone_and_process(repo_url):
     global STORE
+    
     repo_name = repo_url.split("/")[-1]
     repo_path = f"./temp_repos/{repo_name}"
-
-    # Cleanup previous clone if exists
-    if os.path.exists(repo_path):
-        try: shutil.rmtree(repo_path, ignore_errors=True)
-        except: pass
     
-    try:
-        Repo.clone_from(repo_url, repo_path)
-    except: pass # Assuming it exists
+    # Check if we already have this repo loaded
+    if STORE.get("current_repo") == repo_name:
+        print(f"✅ {repo_name} is already active. Skipping.")
+        return {"status": "cached", "count": len(STORE["chunks"])}
+
+    print(f"🔄 Switching context to: {repo_name}...")
+    
+    # RESET STORE
+    STORE = {
+        "chunks": [],
+        "bm25": None,
+        "faiss_minilm": None,
+        "faiss_codebert": None,
+        "current_repo": None
+    }
+
+    # Disk Cache Check
+    if os.path.exists(repo_path):
+        print(f"📂 Found cached files for {repo_name}.")
+    else:
+        print(f"⬇️ Cloning {repo_url}...")
+        try:
+            Repo.clone_from(repo_url, repo_path)
+        except Exception as e:
+            return {"error": f"Clone failed: {str(e)}"}
         
-    documents_minilm = [] 
-    documents_bm25 = []
+    # Re-Index
+    docs_minilm = [] 
+    docs_codebert = []
+    docs_bm25 = []
     metadata = []
     
-    print("🚀 Scanning files...")
-    # Map extensions to parsers
+    print("🚀 Building Index...")
     ext_map = {".py": "python", ".js": "js", ".ts": "js", ".java": "java", ".go": "go", ".dart": "dart"}
 
     for root, dirs, files in os.walk(repo_path):
@@ -187,31 +192,38 @@ def clone_and_process(repo_url):
                         funcs = extract_c_style_functions(content, file, ext_map[ext])
                     
                     for f in funcs:
-                        # Don't index tiny empty functions
-                        if len(f["code"]) < 20: continue
+                        if len(f["code"]) < 20: continue 
 
-                        documents_minilm.append(f["signature"])
-                        documents_bm25.append(f["search_text"])
+                        docs_minilm.append(f["signature"])
+                        docs_codebert.append(f["codebert_text"])
+                        docs_bm25.append(f["search_text"])
                         metadata.append(f)
                 except: pass
 
-    if not documents_minilm: return {"error": "No functions found."}
+    if not docs_minilm: 
+        return {"error": "No functions found."}
 
-    print(f"Indexing {len(documents_minilm)} functions...")
+    print(f"📊 Indexing {len(docs_minilm)} functions...")
 
-    # --- 1. BM25 INDEXING (Full Body) ---
-    tokenized_corpus = [simple_tokenize(doc) for doc in documents_bm25]
-    STORE["bm25"] = BM25Okapi(tokenized_corpus)
+    tokenized_corpus = [simple_tokenize(doc) for doc in docs_bm25]
+    bm25_index = BM25Okapi(tokenized_corpus)
 
-    # --- 2. MINI-LM INDEXING (Signature Only) ---
-    embeddings = model_minilm.encode(documents_minilm)
-    index = faiss.IndexFlatL2(384)
-    index.add(np.array(embeddings))
-    STORE["faiss_minilm"] = index
+    emb_minilm = model_minilm.encode(docs_minilm)
+    index_minilm = faiss.IndexFlatL2(384)
+    index_minilm.add(np.array(emb_minilm))
+
+    emb_codebert = model_codebert.encode(docs_codebert)
+    index_codebert = faiss.IndexFlatL2(768)
+    index_codebert.add(np.array(emb_codebert))
     
     STORE["chunks"] = metadata
+    STORE["bm25"] = bm25_index
+    STORE["faiss_minilm"] = index_minilm
+    STORE["faiss_codebert"] = index_codebert
+    STORE["current_repo"] = repo_name
     
-    return {"status": "success", "count": len(documents_minilm)}
+    print("✅ Indexing Complete.")
+    return {"status": "success", "count": len(docs_minilm)}
 
 def search_query(query, model_type="minilm", k=5):
     global STORE
@@ -220,13 +232,11 @@ def search_query(query, model_type="minilm", k=5):
     results = []
     clean_q = query.lower().replace("code snippet", "").replace("how to", "").strip()
     
-    # --- SEARCH STRATEGY 1: BM25 (Grep) ---
     if model_type == "bm25":
         tokenized_query = simple_tokenize(clean_q)
         doc_scores = STORE["bm25"].get_scores(tokenized_query)
         top_n = np.argsort(doc_scores)[::-1][:k]
         
-        # Normalize Score (0% to 100%)
         max_score = max([doc_scores[i] for i in top_n]) if len(top_n) > 0 else 1.0
         if max_score == 0: max_score = 1.0
 
@@ -235,13 +245,19 @@ def search_query(query, model_type="minilm", k=5):
                 results.append({
                     **STORE["chunks"][idx], 
                     "score": float(doc_scores[idx] / max_score), 
-                    "source_model": "BM25 (Full Body)"
+                    "source_model": "BM25"
                 })
 
-    # --- SEARCH STRATEGY 2: MiniLM (Semantic) ---
     else:
-        query_vector = model_minilm.encode([clean_q])
-        distances, faiss_indices = STORE["faiss_minilm"].search(np.array(query_vector), k)
+        if model_type == "codebert":
+            model = model_codebert
+            index = STORE["faiss_codebert"]
+        else:
+            model = model_minilm
+            index = STORE["faiss_minilm"]
+
+        query_vector = model.encode([clean_q])
+        distances, faiss_indices = index.search(np.array(query_vector), k)
         
         for i, idx in enumerate(faiss_indices[0]):
             if idx < len(STORE["chunks"]) and idx != -1:
@@ -249,7 +265,7 @@ def search_query(query, model_type="minilm", k=5):
                 results.append({
                     **STORE["chunks"][idx],
                     "score": float(score),
-                    "source_model": "MiniLM (Signature)"
+                    "source_model": "CodeBERT" if model_type == "codebert" else "MiniLM"
                 })
                 
     return results
